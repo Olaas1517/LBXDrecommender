@@ -1,0 +1,18 @@
+# virtualenv
+.venv/
+
+# data: never commit. raw/ holds MovieLens + personal Letterboxd exports,
+# processed/ holds derived artifacts. Both are large and/or private.
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# secrets (TMDB key, Gemini key)
+.env
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
