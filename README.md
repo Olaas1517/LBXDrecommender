@@ -15,25 +15,39 @@ Three hard constraints, verified against primary sources:
 3. **Therefore:** the only inputs are your own export ZIP and (optionally) public
    RSS. MovieLens is the only ratings corpus available; TMDB the only metadata API.
 
-## Setup
+## Setup from scratch (e.g. on a new machine)
+
+Nothing in `data/` or `.env` is committed — both are regenerable. Full cold start
+is about 6 minutes, most of it download.
 
 ```bash
+git clone <this repo>
+cd LBXDrecommender
 py -m venv .venv
 .venv\Scripts\python.exe -m pip install -e .
 ```
 
-Put your export path in `.env`:
+Get your Letterboxd export (Settings -> Data -> Export your data; free for all
+members) and point `.env` at the unzipped folder or the ZIP itself:
 
 ```
 LBXD_EXPORT=C:\path\to\letterboxd-you-2026-...
+TMDB_API_KEY=
 ```
 
-Download MovieLens 32M into `data/raw/ml-32m/`, then:
+Download and stage MovieLens 32M (227 MB):
 
 ```bash
+curl.exe -L --fail -o data/raw/ml-32m.zip https://files.grouplens.org/datasets/movielens/ml-32m.zip
+tar -xf data/raw/ml-32m.zip -C data/raw
 .venv\Scripts\python.exe -m lbxd.movielens      # stage (~60s, once)
 .venv\Scripts\python.exe -m scripts.build_cf    # similarity matrix (~135s, once)
 ```
+
+Verify it worked: `build_cf` prints the nearest neighbours of a few films at the
+end. *Battle of Algiers* should come back with Wages of Fear, Throne of Blood,
+Paths of Glory and other world-cinema classics. If that list looks like noise,
+something is wrong with the staging and there is no point going further.
 
 ## Use
 
@@ -112,6 +126,29 @@ Median percentile of held-out liked films, by popularity quintile
    (Love Death & Robots, Sherlock), ~30 Soviet/Kazakh films absent from the
    catalogue, the rest genuinely missing. MovieLens titles are also unreliable —
    *Endgame* is filed as "Avengers: Infinity War - Part II".
+
+## Where to pick up
+
+In priority order. (1) and (2) are the ones that decide whether this project has
+a point — everything else is polish on top of a ranking that currently ties with
+"recommend acclaimed films to everybody".
+
+1. **Score on the consensus residual, not only z.** `match.py` already computes
+   `residual = your_rating - crowd_average` and the scorer ignores it. This is
+   the most likely reason CF only ties the consensus baseline: to beat consensus
+   the signal has to encode *disagreement* with it. Try residual as the CF input
+   value, and a z/residual blend. Measure on the harness, do not eyeball.
+2. **Shrink `pred_z` when support is low.** Predictions currently saturate at
+   4.6–4.96 stars because averaging 2–5 neighbours just reproduces their z.
+   Apply the same trick used on similarity: `pred_z *= support / (support + k)`.
+3. **Filter TV, dedup same-work franchises.** IMDb `title.basics.titleType`.
+4. **IMDb `title.akas` for matching**, then TMDB search as the real identity
+   resolver. Free, no key needed for akas.
+5. **TMDB content track** for post-2023 films, which MovieLens cannot see.
+6. **LLM taste profile** from the review text, and the written pitch.
+
+Re-run `scripts.tune` after any scoring change. The number that matters is the
+stratified table, not aggregate recall.
 
 ## Data sources considered
 
