@@ -219,9 +219,13 @@ known problem 6.
 
 ## Where to pick up
 
-In priority order.
+In priority order. **Item 1 is planned, not done** — the TMDB content track for
+post-2023 films and deep-catalogue obscurities is deliberately deferred to a
+later pass, so until then MovieLens's October 2023 cutoff is a hard edge and
+anything released after it is invisible to the recommender.
 
-1. **The content-based track (TMDB).** This is now the only thing standing
+1. **The content-based track (TMDB).** *Planned — not yet started.* This is now
+   the only thing standing
    between the project and its stated goal. CF is excellent where it has
    evidence and silent where it does not, and the silence is concentrated
    exactly on the obscure films the tool exists to surface. TMDB keywords,
