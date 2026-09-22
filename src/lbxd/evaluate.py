@@ -66,6 +66,11 @@ class EvalReport:
     rating_error: dict[str, float] = field(default_factory=dict)
     # method name -> {"Q1": median percentile, ...}, for CF and every baseline
     stratum_by_method: dict[str, dict[str, float]] = field(default_factory=dict)
+    # One row per (held-out liked film, method): method, quintile, percentile.
+    # Kept raw so that results from many users can be pooled into one
+    # distribution -- medians of medians are not a statistic you can defend, and
+    # a single export only yields n=9 in the least-popular quintile.
+    observations: pd.DataFrame | None = None
 
     def summary(self) -> str:
         L = [
@@ -129,6 +134,17 @@ class EvalReport:
         return "\n".join(L)
 
 
+def popularity_quintiles(ml: MovieLens) -> np.ndarray:
+    """Fixed quintile cut points over the whole catalogue.
+
+    Computed from every film rather than from each run's candidate pool, so that
+    "Q2" denotes the same band of popularity for every user. Without this,
+    pooling across users silently compares different strata to each other.
+    """
+    n_ratings = ml.items["n_ratings"].to_numpy()
+    return np.quantile(n_ratings, [0.2, 0.4, 0.6, 0.8])
+
+
 def _ndcg_at_k(ranked_relevant: np.ndarray, n_relevant: int, k: int) -> float:
     """ranked_relevant: boolean array over the top-k, in rank order."""
     gains = ranked_relevant[:k].astype("float64")
@@ -171,6 +187,7 @@ def evaluate(
     exclude_item_idx: np.ndarray | None = None,
     config: EvalConfig = EVAL,
     n_repeats: int = 10,
+    quintile_cuts: np.ndarray | None = None,
 ) -> EvalReport:
     """Repeated random holdout, pooled.
 
@@ -182,7 +199,8 @@ def evaluate(
     """
     reports = [
         _evaluate_once(
-            matched, cf, ml, profile_mean, profile_sigma, exclude_item_idx, config, seed_offset=i
+            matched, cf, ml, profile_mean, profile_sigma, exclude_item_idx, config,
+            seed_offset=i, quintile_cuts=quintile_cuts,
         )
         for i in range(n_repeats)
     ]
@@ -211,6 +229,9 @@ def evaluate(
             .reset_index()
         )
 
+    pooled_obs = [r.observations for r in reports if r.observations is not None]
+    pooled_obs = pd.concat(pooled_obs, ignore_index=True) if pooled_obs else None
+
     base_names = reports[0].baselines.keys()
     return EvalReport(
         n_train=reports[0].n_train,
@@ -225,6 +246,7 @@ def evaluate(
             nm: avg(lambda r, nm=nm: r.stratum_by_method.get(nm, {}))
             for nm in reports[0].stratum_by_method
         },
+        observations=pooled_obs,
     )
 
 
@@ -237,6 +259,7 @@ def _evaluate_once(
     exclude_item_idx: np.ndarray | None = None,
     config: EvalConfig = EVAL,
     seed_offset: int = 0,
+    quintile_cuts: np.ndarray | None = None,
 ) -> EvalReport:
     """matched needs columns: item_idx, z, weight, rating."""
     rng = np.random.default_rng(config.seed + seed_offset)
@@ -299,7 +322,9 @@ def _evaluate_once(
             p = pos_of_item.get(int(it))
             if p is None or not np.isfinite(scored.rank_score[p]):
                 continue
-            pred_stars = np.clip(profile_mean + profile_sigma * scored.pred_z[p], 0.5, 5.0)
+            pred_stars = np.clip(
+                profile_mean + profile_sigma * cf.config.pred_gain * scored.pred_z[p], 0.5, 5.0
+            )
             rows.append((float(pred_stars), float(actual)))
         if rows:
             arr = np.array(rows)
@@ -320,17 +345,36 @@ def _evaluate_once(
     # useless as a recommender. The honest question is whether personalisation
     # beats it on the films that are NOT widely seen. That is this table.
     by_stratum = None
+    observations = None
     stratum_by_method: dict[str, dict[str, float]] = {}
     if n_relevant:
         rel_list = sorted(rel_positions)
         pop = n_ratings[rel_list].astype("float64")
-        qs = np.quantile(n_ratings, [0.2, 0.4, 0.6, 0.8])
+        qs = quintile_cuts if quintile_cuts is not None else popularity_quintiles(ml)
         stratum = np.array([f"Q{s + 1}" for s in np.digitize(pop, qs)])
 
-        def strata_for(ranking: np.ndarray) -> tuple[pd.DataFrame, dict[str, float]]:
+        obs_frames: list[pd.DataFrame] = []
+
+        # Whether the engine could make ANY claim about this film. Films below
+        # min_support are all tied at -inf, so their "percentile" is just their
+        # position in the tie-break -- an artefact of index order, not a
+        # measurement. Recorded per observation so the tables can separate
+        # "ranked badly" from "declined to rank", which are completely different
+        # failures and were previously averaged together.
+        scoreable_flags = np.array(
+            [bool(np.isfinite(scored.rank_score[p])) for p in rel_list], dtype=bool
+        )
+
+        def strata_for(name: str, ranking: np.ndarray) -> tuple[pd.DataFrame, dict[str, float]]:
             rank_of = np.empty(len(ranking), dtype="int64")
             rank_of[ranking] = np.arange(len(ranking))
             pct = 1.0 - rank_of[rel_list] / max(len(ranking) - 1, 1)
+            obs_frames.append(
+                pd.DataFrame({
+                    "method": name, "quintile": stratum,
+                    "percentile": pct, "scoreable": scoreable_flags,
+                })
+            )
             tbl = (
                 pd.DataFrame({"quintile": stratum, "percentile": pct})
                 .groupby("quintile")
@@ -339,12 +383,13 @@ def _evaluate_once(
             )
             return tbl, dict(zip(tbl["quintile"], tbl["median_percentile"]))
 
-        by_stratum, stratum_by_method["item-item CF"] = strata_for(order)
+        by_stratum, stratum_by_method["item-item CF"] = strata_for("item-item CF", order)
         for name, ranking in (
             ("by consensus", np.argsort(-np.nan_to_num(mean_rating, nan=-1.0), kind="stable")),
             ("by popularity", np.argsort(-n_ratings, kind="stable")),
         ):
-            _, stratum_by_method[name] = strata_for(ranking)
+            _, stratum_by_method[name] = strata_for(name, ranking)
+        observations = pd.concat(obs_frames, ignore_index=True) if obs_frames else None
 
     return EvalReport(
         n_train=len(train_df),
@@ -356,4 +401,5 @@ def _evaluate_once(
         by_stratum=by_stratum,
         rating_error=rating_error,
         stratum_by_method=stratum_by_method,
+        observations=observations,
     )

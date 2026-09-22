@@ -155,21 +155,42 @@ def load_export(path: str | Path) -> LetterboxdExport:
             if not f.exists():  # tolerate likes/ living at the top level
                 f = path / Path(rel).name
             if not f.exists():
-                return None
+                # An export unpacked with its wrapper folder still intact.
+                nested = [
+                    c / rel for c in path.iterdir() if c.is_dir() and (c / rel).exists()
+                ]
+                if not nested:
+                    return None
+                f = nested[0]
             return pd.read_csv(f, encoding="utf-8")
 
     elif path.suffix.lower() == ".zip":
         zf = zipfile.ZipFile(path)
         # Map lowercased archive names -> real names. Exports have been seen both
-        # flat and nested inside a top-level folder, so match on the suffix.
+        # flat and nested inside a top-level folder, so we match on the suffix as
+        # well as exactly.
         names = {n.lower(): n for n in zf.namelist()}
+
+        # Real exports contain deleted/diary.csv and orphaned/reviews.csv
+        # alongside the real ones. Both end with "/diary.csv", so a single pass
+        # that accepts either an exact or a suffix match picks whichever the ZIP
+        # happens to list first -- which silently profiles you on your deleted
+        # entries. Exact match therefore wins outright, and the suffix fallback
+        # (for exports nested one folder deep) skips these two directories.
+        _IGNORED_DIRS = ("deleted/", "orphaned/")
 
         def read(rel: str) -> pd.DataFrame | None:
             target = rel.lower()
-            hit = next(
-                (real for low, real in names.items() if low == target or low.endswith("/" + target)),
-                None,
-            )
+            hit = names.get(target)
+            if hit is None:
+                candidates = [
+                    real
+                    for low, real in names.items()
+                    if low.endswith("/" + target)
+                    and not any(part in low for part in _IGNORED_DIRS)
+                ]
+                # Shallowest wins: "exportfolder/diary.csv" over any deeper copy.
+                hit = min(candidates, key=lambda n: n.count("/")) if candidates else None
             if hit is None:
                 return None
             with zf.open(hit) as fh:

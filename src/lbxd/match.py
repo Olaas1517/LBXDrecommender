@@ -50,6 +50,10 @@ _ARTICLES = (
     "the", "a", "an", "le", "la", "les", "l'", "il", "el", "los", "las",
     "der", "die", "das", "ein", "eine", "de", "het", "en", "et", "os", "as",
 )
+# MovieLens leaves the year out of ~400 titles; build_index stores this
+# sentinel rather than NaN so that year comparisons stay integer.
+_NO_YEAR = -9999
+
 _PAREN = re.compile(r"\(([^()]*)\)")
 _NONWORD = re.compile(r"[^\w\s]", flags=re.UNICODE)
 _WS = re.compile(r"\s+")
@@ -167,7 +171,7 @@ def build_index(ml: MovieLens) -> TitleIndex:
         ml.items["clean_title"].fillna("").astype(str).to_numpy(),
         ml.items["year"].to_numpy(),
     ):
-        y = -9999 if pd.isna(year) else int(year)
+        y = _NO_YEAR if pd.isna(year) else int(year)
         for v in _title_variants(clean):
             by_key.setdefault(v, []).append((int(item_idx), y))
             keys_by_year.setdefault(y, set()).add(v)
@@ -213,9 +217,36 @@ def match_films(
                     near.sort(key=lambda c: abs(c[1] - year))
                     hit, method = near[0], "exact title, year +/-1"
                     break
-            if year is None or len(candidates) == 1:
-                # Unique title match with no year to check against: accept it.
-                hit, method = candidates[0], "exact title, no year check"
+            if year is None:
+                # No year to check against. A unique title is the best we can do.
+                if len(candidates) == 1:
+                    hit, method = candidates[0], "exact title, no year given"
+                    break
+            else:
+                # MovieLens itself often has no year: it writes "Ready Player
+                # One" with no "(2018)" for roughly 400 films. A year cannot
+                # disagree with a year that does not exist, so a unique
+                # candidate whose own year is unknown is still accepted -- this
+                # is the case the original "no year to check against" comment
+                # was actually describing, and conflating it with "the export
+                # gave no year" is what let genuine remakes through.
+                #
+                # MEASURED on a 605-film library: this recovers Ready Player
+                # One, The Northman, Enola Holmes and Henry Sugar, while still
+                # refusing Napoleon (2023)->Napoleon (1927), The Killer
+                # (2023)->The Killer (1989), Wicked (2024)->Wicked (1998) and
+                # six more genuinely wrong pairings.
+                undated = [c for c in candidates if c[1] == _NO_YEAR]
+                if len(undated) == 1 and len(candidates) == 1:
+                    hit, method = undated[0], "exact title, MovieLens has no year"
+                    break
+
+            if not config.require_year_agreement and len(candidates) == 1:
+                # Opt-in legacy behaviour: take a unique title even though its
+                # year disagrees. Recorded under its own method name so that it
+                # shows up in the match report rather than hiding among the
+                # trustworthy matches.
+                hit, method = candidates[0], "unique title, YEAR MISMATCH"
                 break
 
         # --- pass 2: fuzzy, but only within the plausible year window --------

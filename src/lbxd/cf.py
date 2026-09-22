@@ -156,6 +156,36 @@ def user_zscores(ml: MovieLens, sigma_floor: float = 0.5) -> np.ndarray:
     return ((ml.rating - means[ml.user_idx]) / sigmas[ml.user_idx]).astype("float32")
 
 
+def item_z_means(
+    ml: MovieLens, z: np.ndarray | None = None, config: CFConfig = CF
+) -> np.ndarray:
+    """Each film's average z-score across all raters: the consensus baseline.
+
+    This is the quantity the old scorer was missing. `mean_rating` in items.csv
+    is the average in raw stars, which mixes the film's quality together with the
+    generosity of whoever happened to rate it -- popular family films look better
+    than they are because kind raters rate them. Averaging z instead removes the
+    rater from the number, leaving how good the film is *relative to the other
+    films those same people rated*.
+
+    Shrunk toward 0 by co-rating count, for the same reason similarities are: a
+    film with 21 ratings has a noisy mean, and without shrinkage the thinnest
+    films in the catalogue supply the most extreme consensus values and take over
+    whichever end of the ranking the beta dial favours. Zero is the right
+    shrinkage target because z is centred per user, so the global mean z is 0 by
+    construction -- "I know nothing about this film" and "this film is exactly
+    average" are the same statement.
+    """
+    if z is None:
+        z = user_zscores(ml)
+    n_items = ml.n_items
+    counts = np.bincount(ml.item_idx, minlength=n_items).astype("float64")
+    sums = np.bincount(ml.item_idx, weights=z.astype("float64"), minlength=n_items)
+    raw = sums / np.maximum(counts, 1.0)
+    shrunk = raw * (counts / (counts + config.consensus_shrinkage_lambda))
+    return shrunk.astype("float32")
+
+
 # ---------------------------------------------------------------- precompute
 
 
@@ -164,25 +194,60 @@ def build_similarity(
     config: CFConfig = CF,
     block_size: int = 512,
     verbose: bool = True,
+    exclude_users: np.ndarray | None = None,
 ) -> sp.csr_matrix:
-    """Precompute the shrunk, top-K-truncated item-item similarity matrix."""
+    """Precompute the shrunk, top-K-truncated item-item similarity matrix.
+
+    `exclude_users` drops those raters' ratings before building. It exists for
+    the evaluation harness: scoring a MovieLens user against a matrix their own
+    ratings helped build is measuring the system against its own training data.
+    The effect of any single user out of 200,948 is tiny, but "tiny" is not an
+    argument you want load-bearing under a headline number, and excluding them
+    costs nothing.
+    """
     z = user_zscores(ml)
     n_items = ml.n_items
     n_users = int(ml.user_idx.max()) + 1
 
+    item_idx, user_idx = ml.item_idx, ml.user_idx
+    if exclude_users is not None and len(exclude_users):
+        keep = ~np.isin(user_idx, np.asarray(exclude_users, dtype="int64"))
+        if verbose:
+            print(
+                f"  excluding {len(np.unique(exclude_users)):,} held-out users "
+                f"({(~keep).sum():,} ratings) from the similarity build"
+            )
+        z, item_idx, user_idx = z[keep], item_idx[keep], user_idx[keep]
+
     # Items x users, values = z-scores. CSR so that row blocks are cheap to slice.
     Z = sp.csr_matrix(
-        (z, (ml.item_idx, ml.user_idx)), shape=(n_items, n_users), dtype="float32"
+        (z, (item_idx, user_idx)), shape=(n_items, n_users), dtype="float32"
     )
     # Binary twin, for counting co-raters.
     B = sp.csr_matrix(
-        (np.ones(len(z), dtype="float32"), (ml.item_idx, ml.user_idx)),
+        (np.ones(len(z), dtype="float32"), (item_idx, user_idx)),
         shape=(n_items, n_users),
         dtype="float32",
     )
 
+    if config.item_centered:
+        # Subtract each film's own mean z from its OBSERVED entries only.
+        #
+        # Observed-only is what keeps this sparse and what makes it a Pearson
+        # correlation over co-raters rather than an assertion about the millions
+        # of people who never saw the film. The raw per-row mean is used rather
+        # than the shrunk consensus, because centring is only correct if the
+        # centred row actually has zero mean.
+        counts = np.diff(Z.indptr).astype("float64")
+        sums = np.asarray(Z.sum(axis=1)).ravel().astype("float64")
+        row_mean = np.divide(sums, counts, out=np.zeros(len(counts)), where=counts > 0)
+        Z = Z.copy()
+        Z.data = (Z.data - np.repeat(row_mean, np.diff(Z.indptr))).astype("float32")
+        if verbose:
+            print(f"  item-centred: row means removed (sd {row_mean.std():.3f})")
+
     # L2-normalise each item row so that a dot product IS the cosine.
-    norms = np.sqrt(Z.multiply(Z).sum(axis=1)).A.ravel()
+    norms = np.sqrt(np.asarray(Z.multiply(Z).sum(axis=1))).ravel()
     norms[norms == 0] = 1.0
     Zn = sp.diags(1.0 / norms).dot(Z).tocsr()
 
@@ -202,7 +267,14 @@ def build_similarity(
         cnt = (B[start:stop] @ BT).toarray()
 
         # --- the shrinkage step ---
-        np.multiply(sim, cnt / (cnt + config.shrinkage_lambda), out=sim)
+        #
+        # maximum(..., 1) guards lambda=0, where a pair with no co-raters gives
+        # 0/0. NaN would then pass the `v != 0` filter below (NaN != 0 is True)
+        # and land in the matrix, where it silently poisons every prediction that
+        # touches it. Sweeping lambda to 0 to see the unshrunk behaviour is a
+        # reasonable thing to want to do, so it should not corrupt the build.
+        denom = cnt + config.shrinkage_lambda
+        np.multiply(sim, cnt / np.maximum(denom, 1e-9), out=sim)
 
         # A film is trivially its own best neighbour; remove it or every
         # recommendation is just the input back again.
@@ -218,7 +290,7 @@ def build_similarity(
         for local in range(sim.shape[0]):
             cols = top[local]
             v = sim[local, cols]
-            keep = v != 0
+            keep = (v != 0) & np.isfinite(v)
             cols, v = cols[keep], v[keep]
             rows_out.append(np.full(len(cols), start + local, dtype="int32"))
             cols_out.append(cols.astype("int32"))
@@ -237,13 +309,18 @@ def build_similarity(
     return S
 
 
-def save_similarity(S: sp.csr_matrix, ml: MovieLens) -> None:
+def save_similarity(
+    S: sp.csr_matrix, ml: MovieLens, z_mean: np.ndarray | None = None
+) -> None:
     DATA_PROCESSED.mkdir(parents=True, exist_ok=True)
     sp.save_npz(SIM_NPZ, S)
+    if z_mean is None:
+        z_mean = item_z_means(ml)
     np.savez_compressed(
         ITEM_STATS_NPZ,
         n_ratings=ml.items["n_ratings"].to_numpy(dtype="int32"),
         mean_rating=ml.items["mean_rating"].to_numpy(dtype="float32"),
+        z_mean=z_mean.astype("float32"),
     )
 
 
@@ -253,10 +330,11 @@ def save_similarity(S: sp.csr_matrix, ml: MovieLens) -> None:
 @dataclass
 class Scored:
     item_idx: np.ndarray
-    pred_z: np.ndarray
+    pred_z: np.ndarray  # honest absolute prediction, in the user's z units
     support: np.ndarray
     n_neighbours: np.ndarray
     rank_score: np.ndarray
+    pred_d: np.ndarray | None = None  # predicted disagreement with the crowd
 
     def to_frame(self, ml: MovieLens) -> pd.DataFrame:
         df = pd.DataFrame(
@@ -266,6 +344,9 @@ class Scored:
                 "support": self.support,
                 "n_neighbours": self.n_neighbours,
                 "rank_score": self.rank_score,
+                "pred_d": (
+                    self.pred_d if self.pred_d is not None else np.zeros_like(self.pred_z)
+                ),
             }
         )
         cols = ml.items[["item_idx", "clean_title", "year", "n_ratings", "mean_rating", "tmdbId", "genres"]]
@@ -275,21 +356,50 @@ class Scored:
 class ItemItemCF:
     """Loaded similarity matrix plus the scoring logic."""
 
-    def __init__(self, S: sp.csr_matrix, n_ratings: np.ndarray, config: CFConfig = CF):
+    def __init__(
+        self,
+        S: sp.csr_matrix,
+        n_ratings: np.ndarray,
+        config: CFConfig = CF,
+        z_mean: np.ndarray | None = None,
+    ):
         self.S = S
         self.n_ratings = n_ratings
         self.config = config
+        # The consensus baseline. Zeros is the honest fallback for a matrix built
+        # before this existed: it degrades to the old behaviour rather than
+        # inventing a consensus, and the caller sees it in the eval numbers.
+        self.z_mean = (
+            np.zeros(S.shape[0], dtype="float32") if z_mean is None else z_mean.astype("float32")
+        )
         self._median_n = float(np.median(n_ratings[n_ratings > 0]))
 
     @classmethod
     def load(cls, config: CFConfig = CF) -> ItemItemCF:
         if not SIM_NPZ.exists():
             raise FileNotFoundError(
-                f"{SIM_NPZ} missing. Run: py -m scripts.build_cf"
+                f"{SIM_NPZ} missing. Run: python -m scripts.build_cf"
             )
         S = sp.load_npz(SIM_NPZ).tocsr()
         stats = np.load(ITEM_STATS_NPZ)
-        return cls(S, stats["n_ratings"], config)
+        z_mean = stats["z_mean"] if "z_mean" in stats.files else None
+        if z_mean is None:
+            print(
+                "  ! item_stats.npz predates consensus decomposition and has no "
+                "z_mean; falling back to zeros (i.e. the old scorer). "
+                "Re-run scripts.build_cf to fix."
+            )
+        return cls(S, stats["n_ratings"], config, z_mean)
+
+    def input_values(self, rated_items: np.ndarray, z: np.ndarray) -> np.ndarray:
+        """What actually goes into the weighted average: z, or z minus consensus.
+
+        Shared by score() and explain() so that the explanation is always in
+        terms of the quantity the ranking was actually computed from.
+        """
+        if not self.config.use_residual_input:
+            return np.asarray(z, dtype="float64")
+        return np.asarray(z, dtype="float64") - self.z_mean[rated_items]
 
     def score(
         self,
@@ -308,6 +418,13 @@ class ItemItemCF:
         if weights is None:
             weights = np.ones(len(rated_items), dtype="float32")
 
+        rated_items = np.asarray(rated_items, dtype="int64")
+        cfg = self.config
+
+        # z, or z with the crowd subtracted out -- see CFConfig.use_residual_input
+        # for why the second one is what makes this beat the consensus baseline.
+        values = self.input_values(rated_items, z)
+
         n_items = self.S.shape[0]
         num = np.zeros(n_items, dtype="float64")
         den = np.zeros(n_items, dtype="float64")
@@ -316,24 +433,56 @@ class ItemItemCF:
         # Walk the rows of S belonging to films they rated, accumulating the
         # weighted average described in the module docstring.
         indptr, indices, data = self.S.indptr, self.S.indices, self.S.data
-        for item, zi, wi in zip(rated_items, z, weights):
+        for item, vi, wi in zip(rated_items, values, weights):
             lo, hi = indptr[item], indptr[item + 1]
             cols = indices[lo:hi]
             sims = data[lo:hi]
-            num[cols] += sims * (zi * wi)
+            num[cols] += sims * (vi * wi)
             den[cols] += np.abs(sims) * wi
             cnt[cols] += 1
 
-        pred_z = np.divide(num, den, out=np.zeros_like(num), where=den > 1e-9)
+        pred = np.divide(num, den, out=np.zeros_like(num), where=den > 1e-9)
+
+        # --- support shrinkage ---
+        #
+        # Without this every prediction came back 4.6-4.96 stars: a weighted
+        # average over three neighbours just hands back those neighbours' values,
+        # with no memory of how little was behind them. Pulling thin predictions
+        # toward 0 pulls the star estimate toward the user's own mean, which is
+        # the correct thing to say when we know almost nothing.
+        if cfg.pred_shrinkage_k > 0:
+            pred = pred * (den / (den + cfg.pred_shrinkage_k))
+
+        # How much the personal term is trusted in the RANKING, by evidence.
+        # See CFConfig.rank_shrinkage_k: this is what stops a film with one weak
+        # neighbour from taking the top slot on a prediction built out of
+        # nothing, and it is what makes a low min_support safe to run.
+        if cfg.rank_shrinkage_k > 0:
+            trust = den / (den + cfg.rank_shrinkage_k)
+        else:
+            trust = np.ones_like(den)
+
+        if cfg.use_residual_input:
+            # pred is predicted DISAGREEMENT. The honest absolute prediction adds
+            # the crowd's own standing back in; the ranking adds back only as
+            # much of it as beta asks for, and trusts the personal part only as
+            # far as the evidence goes.
+            pred_d = pred
+            pred_z = self.z_mean.astype("float64") + pred_d
+            base = cfg.consensus_beta * self.z_mean.astype("float64") + pred_d * trust
+        else:
+            pred_d = None
+            pred_z = pred
+            base = pred * trust
 
         # Novelty penalty, in z-units per decade of popularity.
         pop = np.maximum(self.n_ratings.astype("float64"), 1.0)
-        penalty = self.config.popularity_alpha * np.log10(pop / self._median_n)
-        rank_score = pred_z - penalty
+        penalty = cfg.popularity_alpha * np.log10(pop / self._median_n)
+        rank_score = base - penalty
 
         # Anything we have no business making a claim about is pushed to -inf
         # rather than silently ranked.
-        weak = den < self.config.min_support
+        weak = den < cfg.min_support
         rank_score[weak] = -np.inf
 
         mask = np.ones(n_items, dtype=bool)
@@ -348,6 +497,7 @@ class ItemItemCF:
             support=den[keep],
             n_neighbours=cnt[keep],
             rank_score=rank_score[keep],
+            pred_d=None if pred_d is None else pred_d[keep],
         )
 
     def explain(self, candidate: int, rated_items: np.ndarray, z: np.ndarray, top: int = 5):
@@ -358,9 +508,12 @@ class ItemItemCF:
         """
         row = self.S[candidate]
         sim_by_item = dict(zip(row.indices, row.data))
+        # Explain in the same units the ranking was computed in: in residual mode
+        # the driver is "you disagreed with the crowd about X", not "you liked X".
+        values = self.input_values(np.asarray(rated_items, dtype="int64"), z)
         contribs = [
-            (int(i), float(sim_by_item.get(int(i), 0.0) * zi))
-            for i, zi in zip(rated_items, z)
+            (int(i), float(sim_by_item.get(int(i), 0.0) * vi))
+            for i, vi in zip(rated_items, values)
             if int(i) in sim_by_item
         ]
         contribs.sort(key=lambda t: -abs(t[1]))

@@ -57,15 +57,36 @@ class TasteProfile:
     config: NormalizeConfig
     warnings: list[str]
 
-    def to_stars(self, z: float | np.ndarray) -> float | np.ndarray:
+    def to_stars(self, z: float | np.ndarray, gain: float | None = None) -> float | np.ndarray:
         """Convert a predicted z-score back into predicted stars.
 
         This is why we bother being careful about mean and sigma: it lets the
         product say "we think you'll give this 4.2" -- a falsifiable, checkable
         claim -- instead of an invented "97% match".
+
+        `gain` defaults to 1, which keeps this an exact inverse of the z-score:
+        to_stars(z_of(r)) == r. That identity matters -- this method is also used
+        to put the CROWD's opinion on your scale, and to read your own ratings
+        back -- so the calibration gain is NOT applied here by default. Use
+        predicted_stars() for a CF prediction, which is the only place the
+        attenuation correction belongs.
         """
-        stars = self.mean + self.sigma * np.asarray(z, dtype="float64")
+        g = 1.0 if gain is None else gain
+        stars = self.mean + self.sigma * g * np.asarray(z, dtype="float64")
         return np.clip(stars, 0.5, 5.0)
+
+    def predicted_stars(self, pred_z: float | np.ndarray, gain: float | None = None):
+        """Turn a CF prediction into stars, correcting for attenuation.
+
+        Separate from to_stars() because a prediction and an observation are not
+        the same kind of number. Averaging over neighbours shrinks the spread of
+        predictions to roughly half that of real ratings, so a prediction
+        converted naively says 3.4 where the truth is 4.1. See CFConfig.pred_gain
+        for the measurement.
+        """
+        from .config import CF
+
+        return self.to_stars(pred_z, CF.pred_gain if gain is None else gain)
 
     def summary(self) -> str:
         f = self.films
