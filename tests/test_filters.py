@@ -185,3 +185,76 @@ class TestExplainability:
         df = pd.DataFrame([("Stalker", 1979, 9.0)],
                           columns=["clean_title", "year", "rank_score"])
         assert len(diversify(df, 10, FILTER)) == 1
+
+
+class TestPredictedFloor:
+    def _frame(self, rows):
+        return pd.DataFrame(
+            rows, columns=["clean_title", "year", "rank_score", "pred_z", "n_neighbours"]
+        )
+
+    def test_a_below_average_prediction_is_not_offered(self):
+        """pred_z is in units of your own distribution, so 0 is your mean. The
+        novelty bonus and the crowd term can float a negative prediction high
+        enough to top a HIDDEN GEMS list; it is still not a recommendation."""
+        df = self._frame([
+            ("Predicted Bad", 2014, 9.0, -0.40, 5),
+            ("Predicted Good", 1962, 8.0, 0.80, 5),
+        ])
+        out = diversify(df, 10, FILTER)
+        assert list(out["clean_title"]) == ["Predicted Good"]
+
+    def test_exactly_average_is_allowed(self):
+        df = self._frame([("Exactly Average", 1970, 9.0, 0.0, 5)])
+        assert len(diversify(df, 10, FILTER)) == 1
+
+    def test_the_floor_can_be_switched_off(self):
+        df = self._frame([("Predicted Bad", 2014, 9.0, -0.4, 5)])
+        out = diversify(df, 10, FilterConfig(min_predicted_z=None))
+        assert len(out) == 1
+
+
+class TestMovieLensTitleQuirks:
+    """Real MovieLens titles, which are messier than the synthetic ones."""
+
+    def test_article_inversion_plus_alternate_title_still_dedups(self):
+        """"Human Condition III, The (Ningen no joken III)" -- the article is
+        rotated to the end AND an alternate title follows it, so the part number
+        sits mid-string with two layers of noise after it. Both parts reached a
+        single recommendation list before this was handled."""
+        a = work_key("Human Condition II, The (Ningen no joken II)", 1959)
+        b = work_key("Human Condition III, The (Ningen no joken III)", 1961)
+        assert a == b == "work::the human condition"
+
+    def test_a_rotated_article_alone_does_not_create_a_part(self):
+        for title, year in [
+            ("Matrix, The", 1999),
+            ("Battle of Algiers, The (La battaglia di Algeri)", 1966),
+            ("Godfather, The", 1972),
+        ]:
+            assert work_key(title, year).startswith("title::")
+
+    def test_godfather_part_two_is_a_part(self):
+        assert work_key("Godfather: Part II, The", 1974) == "work::the godfather"
+
+    def test_aka_titles_are_not_mangled(self):
+        assert work_key("Seven (a.k.a. Se7en)", 1995) == "title::seven::1995"
+
+
+class TestDisplayTitle:
+    @pytest.mark.parametrize("raw,shown", [
+        ("Battle of Algiers, The (La battaglia di Algeri)", "The Battle of Algiers"),
+        ("Human Condition III, The (Ningen no joken III)", "The Human Condition III"),
+        ("Harakiri (Seppuku)", "Harakiri"),
+        ("Matrix, The", "The Matrix"),
+        ("Yojimbo", "Yojimbo"),
+    ])
+    def test_titles_read_the_way_people_write_them(self, raw, shown):
+        from lbxd.filters import display_title
+        assert display_title(raw) == shown
+
+    def test_never_returns_empty(self):
+        """A title that is nothing but a parenthetical must not vanish."""
+        from lbxd.filters import display_title
+        assert display_title("(Untitled)") != ""
+        assert display_title("") == ""

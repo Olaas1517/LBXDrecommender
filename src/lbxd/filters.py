@@ -169,6 +169,28 @@ _NONWORD = re.compile(r"[^\w\s]", flags=re.UNICODE)
 _WS = re.compile(r"\s+")
 
 
+# MovieLens rotates a leading article to the end: "Human Condition II, The".
+# That puts ", The" AFTER the part number, so a part-stripper anchored at the
+# end of the string sees "The" and stops -- which is why Human Condition II and
+# III were offered in the same list. Rotate it back before stripping.
+_ARTICLES = (
+    "the", "a", "an", "le", "la", "les", "l'", "l’", "il", "lo", "el", "los",
+    "las", "der", "die", "das", "ein", "eine", "de", "het", "en", "et",
+    "os", "as", "o", "un", "una", "uno", "i", "gli",
+)
+
+
+def _unrotate_article(title: str) -> str:
+    head, sep, tail = str(title).rpartition(",")
+    art = tail.strip()
+    if sep and art.lower() in _ARTICLES:
+        # An elided article joins straight on: "Eclisse, L'" -> "L'Eclisse",
+        # not "L' Eclisse".
+        joiner = "" if art.endswith(("'", "\u2019")) else " "
+        return f"{art}{joiner}{head.strip()}"
+    return str(title)
+
+
 def _strip_parts(title: str) -> tuple[str, bool]:
     """Remove a part marker from a title. Returns (stripped, had_marker).
 
@@ -176,7 +198,12 @@ def _strip_parts(title: str) -> tuple[str, bool]:
     the base of a multi-part title is -- which they did, silently, and the
     recommender went on offering part III of a work already being watched.
     """
-    base = _CUT.sub("", str(title))
+    # Parenthesised alternates come off FIRST. A real MovieLens title is
+    # "Human Condition III, The (Ningen no joken III)", and rotating the article
+    # on that string finds ", The (Ningen no joken III)" -- not an article -- so
+    # the rotation silently fails and the part number stays buried mid-title.
+    # That is exactly how Human Condition II and III ended up in one list.
+    base = _CUT.sub("", _unrotate_article(_PAREN.sub(" ", str(title)).strip()))
     stripped = _PART.sub("", base)
     if stripped == base:
         stripped = _TRAILING_ROMAN.sub("", base)
@@ -227,6 +254,19 @@ def series_key(clean_title: str) -> str | None:
     return k if len(k) >= 4 else None
 
 
+def display_title(clean_title: str) -> str:
+    """A MovieLens title as a human would write it.
+
+    MovieLens stores "Battle of Algiers, The (La battaglia di Algeri)": article
+    rotated to the end, original-language title in parentheses. Neither belongs
+    in output someone reads -- and truncating that string to fit a column cuts
+    it mid-parenthetical. Returns "The Battle of Algiers".
+    """
+    t = _PAREN.sub("", str(clean_title)).strip()
+    t = _unrotate_article(t).strip()
+    return _WS.sub(" ", t) or str(clean_title)
+
+
 def base_titles(clean_title: str) -> set[str]:
     """Every simplified base title one catalogue entry should answer to.
 
@@ -238,6 +278,7 @@ def base_titles(clean_title: str) -> set[str]:
     """
     raw = str(clean_title)
     out = {_simplify(_strip_parts(_PAREN.sub(" ", raw))[0])}
+    out.add(_simplify(_strip_parts(_unrotate_article(_PAREN.sub(" ", raw)))[0]))
     for inner in _PAREN_INNER.findall(raw):
         out.add(_simplify(_strip_parts(inner)[0]))
     return {k for k in out if len(k) >= 3}
@@ -282,6 +323,12 @@ def diversify(
     keep_rows = []
     for pos, row in enumerate(df.itertuples(index=False)):
         title = getattr(row, "clean_title", "") or ""
+
+        # A film we expect you to rate below your own average is not advice.
+        pz = getattr(row, "pred_z", None)
+        if pz is not None and config.min_predicted_z is not None:
+            if pz < config.min_predicted_z:
+                continue
 
         # A result with one neighbour behind it has no explanation to give.
         nb = getattr(row, "n_neighbours", None)

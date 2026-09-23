@@ -382,6 +382,18 @@ class FilterConfig:
     # for a film indexed under both its theatrical and extended cuts.
     dedupe_same_work: bool = True
 
+    # Never offer a film we predict you will rate below your own average.
+    #
+    # pred_z is in units of your own rating distribution, so 0 is your mean.
+    # A negative prediction says "we think this is a below-average watch FOR
+    # YOU" -- which can still rank well, because rank_score also carries the
+    # crowd's opinion and the novelty bonus. In gem mode that combination put
+    # "Broken (2014), predicted 2.09 stars" on a list headed HIDDEN GEMS, for
+    # a user whose mean is 2.62.
+    #
+    # Ranking it is fine and it stays in the evaluation. Recommending it is not.
+    min_predicted_z: float = 0.0
+
     # Never show a recommendation that cannot be explained.
     #
     # The engine's whole claim over matrix factorisation is that every result

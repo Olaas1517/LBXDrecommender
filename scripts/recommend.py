@@ -24,7 +24,9 @@ from dotenv import load_dotenv
 from lbxd import movielens
 from lbxd.cf import ItemItemCF
 from lbxd.config import CF, FILTER, NormalizeConfig
-from lbxd.filters import diversify, film_mask, seen_work_keys, short_mask
+from lbxd.filters import (
+    display_title, diversify, film_mask, seen_work_keys, short_mask,
+)
 from lbxd.evaluate import evaluate
 from lbxd.ingest import load_export
 from lbxd.match import match_films
@@ -161,7 +163,7 @@ def main() -> int:
     for _, r in df.iterrows():
         stars = profile.predicted_stars(r["pred_z"])
         yr = "" if r["year"] != r["year"] else int(r["year"])
-        print(f"\n  {r['clean_title']} ({yr})")
+        print(f"\n  {display_title(r['clean_title'])} ({yr})")
         print(
             f"    predicted {stars:.2f} stars (your mean is {profile.mean:.2f})"
             f"  |  {int(r['n_ratings']):,} MovieLens ratings"
@@ -176,13 +178,20 @@ def main() -> int:
                 f"we predict you {'above' if r['pred_d'] > 0 else 'below'} that "
                 f"by {abs(r['pred_d']):.2f}z"
             )
-        because = cf.explain(int(r["item_idx"]), rated_items, z, top=3)
-        if because:
-            parts = []
-            for item_idx, contrib in because:
-                row = ml.items.iloc[item_idx]
-                direction = "+" if contrib > 0 else "-"
-                parts.append(f"{direction}{row['clean_title']}")
+        # De-duplicated by title: MovieLens files several distinct entries under
+        # one name (every part of War and Peace is "War and Peace (Voyna i mir)"),
+        # so the raw list prints the same film three times and looks broken.
+        seen_names: set[str] = set()
+        parts = []
+        for item_idx, contrib in cf.explain(int(r["item_idx"]), rated_items, z, top=12):
+            name = display_title(ml.items.iloc[item_idx]["clean_title"])
+            if name.lower() in seen_names:
+                continue
+            seen_names.add(name.lower())
+            parts.append(("+" if contrib > 0 else "-") + name)
+            if len(parts) >= 3:
+                break
+        if parts:
             print(f"    because: {', '.join(parts)}")
     return 0
 

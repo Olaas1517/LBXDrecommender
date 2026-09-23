@@ -19,7 +19,7 @@ import numpy as np
 from lbxd import movielens
 from lbxd.cf import ItemItemCF
 from lbxd.config import CF, FILTER
-from lbxd.filters import diversify, film_mask, seen_work_keys
+from lbxd.filters import diversify, display_title, film_mask, seen_work_keys
 from lbxd.ingest import load_export
 from lbxd.match import match_films
 from lbxd.normalize import build_profile
@@ -28,9 +28,8 @@ W = 78
 
 
 def rule(title: str) -> None:
-    print("\n" + "=" * W)
-    print(title)
-    print("=" * W)
+    print(f"\n\033[1m{title}\033[0m")
+    print("-" * W)
 
 
 def wait(on: bool) -> None:
@@ -43,7 +42,7 @@ def wait(on: bool) -> None:
 
 class Demo:
     def __init__(self, export_path: str):
-        print("loading MovieLens, similarity matrix and your export...", flush=True)
+        print("loading...", end="", flush=True)
         self.export = load_export(export_path)
         self.profile = build_profile(self.export)
         self.ml = movielens.load()
@@ -56,32 +55,48 @@ class Demo:
         self.w = self.matched["weight"].to_numpy(dtype="float32")
         self.films_ok = film_mask(self.ml)
         self.titles = self.ml.items.set_index("item_idx")["clean_title"].to_dict()
-        print("ready.\n")
+        # Films already shown in an earlier section. Each mode is the same engine
+        # with a different dial, so a mid-popularity film can legitimately top
+        # both the balanced and the gem list -- true, and it reads as the system
+        # repeating itself.
+        self.already_shown: set[int] = set()
+        print(" ready")
+
+    def because(self, candidate: int, top: int = 3) -> str:
+        """The films that drove this result, de-duplicated by title.
+
+        MovieLens holds several distinct entries under one title -- the parts of
+        Bondarchuk's War and Peace are all "War and Peace (Voyna i mir)" -- so a
+        raw list prints "+War and Peace, +War and Peace" and looks broken.
+        """
+        seen: set[str] = set()
+        parts: list[str] = []
+        for i, c in self.cf.explain(candidate, self.items, self.z, top=12):
+            name = display_title(self.titles.get(i, "?"))
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            parts.append(("+" if c > 0 else "-") + name[:30])
+            if len(parts) >= top:
+                break
+        return ", ".join(parts) if parts else "(no single film dominates)"
 
     # ---------------------------------------------------------------- sections
 
     def profile_section(self) -> None:
-        rule("1.  WHO THE SYSTEM THINKS YOU ARE")
+        rule("PROFILE")
         p = self.profile
-        print(f"    {len(p.films)} rated films, {len(self.matched)} matched to MovieLens "
-              f"({len(self.matched) / len(p.films):.0%})")
-        print(f"    your mean {p.mean:.2f} stars, spread {p.sigma_raw:.2f}")
-        print(f"    {len(self.seen_idx)} watched films excluded from every result\n")
-        print("    Ratings are converted to z-scores against YOUR OWN bar, not an")
-        print("    absolute scale -- a 3.5 from someone who averages 2.6 is praise.\n")
-        top = p.films.nlargest(5, "z")[["title", "rating", "z"]]
-        print("    strongest positives:")
-        for _, r in top.iterrows():
-            print(f"      {r['rating']:.1f}  z={r['z']:+.2f}  {r['title']}")
-        bot = p.films.nsmallest(3, "z")[["title", "rating", "z"]]
-        print("\n    strongest negatives (these do real work -- films similar to")
-        print("    things you hated get pushed DOWN, not merely left out):")
-        for _, r in bot.iterrows():
-            print(f"      {r['rating']:.1f}  z={r['z']:+.2f}  {r['title']}")
+        print(f"  {len(p.films)} rated  ·  {len(self.matched)} matched to MovieLens "
+              f"({len(self.matched) / len(p.films):.0%})  ·  mean {p.mean:.2f}  ·  "
+              f"spread {p.sigma_raw:.2f}  ·  {len(self.seen_idx)} watched excluded")
+        top = " · ".join(p.films.nlargest(3, "z")["title"].str.slice(0, 30))
+        bot = " · ".join(p.films.nsmallest(3, "z")["title"].str.slice(0, 30))
+        print(f"  loved   {top}")
+        print(f"  hated   {bot}")
 
-    def recommend(self, mode: str, n: int, header: str, note: str) -> None:
+    def recommend(self, mode: str, n: int, header: str) -> None:
         rule(header)
-        print(f"    {note}\n")
         spec = {
             "balanced": dict(alpha=0.15, max_pop=None, min_pop=None, ms=None),
             "gem": dict(alpha=0.40, max_pop=3000, min_pop=None, ms=0.01),
@@ -91,7 +106,10 @@ class Demo:
             CF, popularity_alpha=spec["alpha"],
             min_support=spec["ms"] if spec["ms"] is not None else CF.min_support,
         )
-        scored = self.cf.score(self.items, self.z, self.w, exclude=self.seen_idx)
+        exclude = self.seen_idx
+        if self.already_shown:
+            exclude = np.union1d(exclude, np.fromiter(self.already_shown, dtype=int))
+        scored = self.cf.score(self.items, self.z, self.w, exclude=exclude)
         df = scored.to_frame(self.ml)
         if spec["max_pop"]:
             df = df[df["n_ratings"] <= spec["max_pop"]]
@@ -101,79 +119,72 @@ class Demo:
         df = df[self.films_ok[df["item_idx"].to_numpy()]]
         df = df.sort_values("rank_score", ascending=False)
         df = diversify(df, n, FILTER, exclude_works=seen_work_keys(self.ml, self.seen_idx))
+        if df.empty:
+            print("  (nothing left under these settings)")
+            return
 
         for _, r in df.iterrows():
+            self.already_shown.add(int(r["item_idx"]))
             yr = "" if r["year"] != r["year"] else f" ({int(r['year'])})"
             stars = self.profile.predicted_stars(r["pred_z"])
-            print(f"    {r['clean_title']}{yr}")
-            print(f"        predicted {stars:.2f}    {int(r['n_ratings']):,} ratings"
-                  f"    support {r['support']:.1f} from {int(r['n_neighbours'])} neighbours")
-            because = self.cf.explain(int(r["item_idx"]), self.items, self.z, top=3)
-            if because:
-                parts = [("+" if c > 0 else "-") + str(self.titles.get(i, "?"))[:34]
-                         for i, c in because]
-                print(f"        because: {', '.join(parts)}")
-            print()
+            name = (display_title(r["clean_title"]) + yr)[:46]
+            print(f"  {stars:.2f}  {name:<46} {int(r['n_ratings']):>7,} ratings")
+            print(f"        \033[2m{self.because(int(r['item_idx']))}\033[0m")
 
     def proof_section(self) -> None:
-        rule("4.  DOES IT ACTUALLY WORK?  (leave-one-out on films you rated 5.0)")
-        print("    Hide a film you loved, rebuild the profile without it, and see")
-        print("    where it lands among ~22,000 candidates it has never seen you rate.\n")
+        rule("VALIDATION  ·  hide a film you rated 5.0, see where it comes back")
         self.cf.config = CF
-        picks = self.matched[self.matched["rating"] == 5.0].head(6)
-        for _, r in picks.iterrows():
+        for _, r in self.matched[self.matched["rating"] == 5.0].head(6).iterrows():
             tgt = int(r["item_idx"])
             pos = int(np.flatnonzero(self.items == tgt)[0])
             keep = np.ones(len(self.items), bool)
             keep[pos] = False
-            s = self.cf.score(self.items[keep], self.z[keep], self.w[keep],
-                              exclude=np.setdiff1d(self.seen_idx, [tgt]))
-            ok = self.films_ok[s.item_idx] | (s.item_idx == tgt)
-            idx, rs = s.item_idx[ok], s.rank_score[ok]
+            s_ = self.cf.score(self.items[keep], self.z[keep], self.w[keep],
+                               exclude=np.setdiff1d(self.seen_idx, [tgt]))
+            ok = self.films_ok[s_.item_idx] | (s_.item_idx == tgt)
+            idx, rs = s_.item_idx[ok], s_.rank_score[ok]
             ranked = idx[np.argsort(-rs, kind="stable")]
             hit = np.flatnonzero(ranked == tgt)
             if not len(hit):
                 continue
-            rank = int(hit[0]) + 1
-            pct = rank / len(ranked)
-            bar = "#" * max(int((1 - pct) * 34), 0)
-            print(f"    {str(self.titles.get(tgt, '?'))[:40]:<40} rank {rank:>6,}/{len(ranked):,}"
-                  f"  top {pct * 100:>5.1f}%  {bar}")
-        print("\n    A film rated >=4.5 outranks one rated <=1.0 83% of the time (AUC 0.834).")
+            rank, total = int(hit[0]) + 1, len(ranked)
+            pct = rank / total
+            print(f"  {display_title(self.titles.get(tgt, '?'))[:46]:<46}"
+                  f" {rank:>6,}/{total:,}   top {pct * 100:>4.1f}%")
+        print(f"\n  \033[2mloved (>=4.5) outranks hated (<=1.0) 83% of the time"
+              f"  ·  AUC 0.834\033[0m")
 
     def eval_section(self) -> None:
-        rule("5.  MEASURED AGAINST BASELINES  (300 held-out MovieLens users)")
-        print("    Median percentile of held-out liked films, by how widely seen the")
-        print("    film is. Q1 = most obscure. The baseline that matters is 'consensus'")
-        print("    -- just recommending acclaimed films to everybody.\n")
+        rule("VS BASELINES  ·  300 held-out users, excluded from training")
         rows = [
-            ("item-item CF (this)", 0.542, 0.809, 0.874, 0.947),
-            ("by consensus",        0.445, 0.697, 0.661, 0.784),
-            ("by popularity",       0.129, 0.327, 0.547, 0.749),
+            ("item-item CF", 0.542, 0.809, 0.874, 0.947),
+            ("consensus", 0.445, 0.697, 0.661, 0.784),
+            ("popularity", 0.129, 0.327, 0.547, 0.749),
         ]
-        print(f"    {'':<22}{'Q1':>9}{'Q2':>9}{'Q3':>9}{'Q4':>9}")
+        print(f"  {'':<16}{'Q1':>8}{'Q2':>8}{'Q3':>8}{'Q4':>8}    \033[2m"
+              f"median percentile, Q1 = most obscure\033[0m")
         for name, *vals in rows:
-            print(f"    {name:<22}" + "".join(f"{v:>9.3f}" for v in vals))
-        print("\n    Those users were EXCLUDED from the similarity matrix, so this is")
-        print("    not measuring the system against its own training data.")
+            line = f"  {name:<16}" + "".join(f"{v:>8.3f}" for v in vals)
+            print(f"\033[1m{line}\033[0m" if name == "item-item CF" else line)
 
     def like_section(self, title_query: str) -> None:
-        rule(f'NEAREST NEIGHBOURS OF "{title_query}"')
+        rule(f'NEIGHBOURS OF "{title_query}"')
         hits = self.ml.items[
             self.ml.items["clean_title"].fillna("").str.contains(
                 title_query, case=False, regex=False)
         ]
         if hits.empty:
-            print(f"    '{title_query}' is not in the MovieLens catalogue.")
-            print("    (It ends October 2023, so anything newer is invisible.)")
+            print(f"  '{title_query}' is not in MovieLens "
+                  "(catalogue ends October 2023).")
             return
         row = hits.nlargest(1, "n_ratings").iloc[0]
         idx = int(row["item_idx"])
-        print(f"    matched: {row['clean_title']} ({row['year']})  "
+        yr0 = "" if row["year"] != row["year"] else f" ({int(row['year'])})"
+        print(f"  {display_title(row['clean_title'])}{yr0}  ·  "
               f"{int(row['n_ratings']):,} ratings\n")
         nb = self.cf.S[idx]
         if nb.nnz == 0:
-            print("    too few co-raters to have meaningful neighbours.")
+            print("  too few co-raters for meaningful neighbours.")
             return
         for o in np.argsort(-nb.data)[:10]:
             j = int(nb.indices[o])
@@ -181,7 +192,7 @@ class Demo:
                 continue
             jr = self.ml.items.iloc[j]
             yr = "" if jr["year"] != jr["year"] else f" ({int(jr['year'])})"
-            print(f"      {nb.data[o]:+.3f}  {jr['clean_title']}{yr}")
+            print(f"  {nb.data[o]:+.3f}  {display_title(jr['clean_title'])}{yr}")
 
 
 def main() -> int:
@@ -212,18 +223,13 @@ def main() -> int:
     if only in (None, "profile"):
         d.profile_section(); wait(args.pause and only is None)
     if only in (None, "recs"):
-        d.recommend("balanced", args.n, "2.  RECOMMENDATIONS",
-                    "Every result explains itself -- which of your films drove it, "
-                    "and\n    how far from the crowd's opinion we expect you to land.")
+        d.recommend("balanced", args.n, "RECOMMENDATIONS")
         wait(args.pause and only is None)
     if only in (None, "gem"):
-        d.recommend("gem", args.n, "3.  HIDDEN GEMS  (obscure, high predicted rating)",
-                    "Same engine, different novelty setting and a hard popularity cap\n"
-                    "    at 3,000 ratings. Not a different algorithm.")
+        d.recommend("gem", args.n, "HIDDEN GEMS  ·  same engine, novelty dial up, capped at 3k ratings")
         wait(args.pause and only is None)
     if only == "blindspot":
-        d.recommend("blindspot", args.n, "BLIND SPOTS  (widely seen, you have not)",
-                    "No novelty penalty at all -- obviousness is the point here.")
+        d.recommend("blindspot", args.n, "BLIND SPOTS  ·  widely seen, you have not")
     if only in (None, "proof"):
         d.proof_section(); wait(args.pause and only is None)
     if only in (None, "eval"):

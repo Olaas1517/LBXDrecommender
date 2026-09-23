@@ -506,15 +506,27 @@ class ItemItemCF:
         This is the interpretability payoff of item-item CF, and it is what the
         LLM layer will be handed instead of being asked to invent a reason.
         """
-        row = self.S[candidate]
-        sim_by_item = dict(zip(row.indices, row.data))
-        # Explain in the same units the ranking was computed in: in residual mode
-        # the driver is "you disagreed with the crowd about X", not "you liked X".
-        values = self.input_values(np.asarray(rated_items, dtype="int64"), z)
-        contribs = [
-            (int(i), float(sim_by_item.get(int(i), 0.0) * vi))
-            for i, vi in zip(rated_items, values)
-            if int(i) in sim_by_item
-        ]
+        # Read the SAME direction the scorer reads.
+        #
+        # S is truncated to the top-K neighbours of each row, which makes it
+        # asymmetric: j can be in i's row while i is absent from j's. score()
+        # walks the rows of the films you RATED and accumulates into candidates,
+        # so a contribution exists when the rated film's row contains the
+        # candidate. Reading the candidate's row instead -- which this used to do
+        # -- answers a different question, and silently disagreed with the number
+        # it was supposed to explain: "Broken (2014)" scored from 2 neighbours and
+        # explained itself with 0, printing a recommendation with no reason.
+        rated_items = np.asarray(rated_items, dtype="int64")
+        # In residual mode the driver is "you disagreed with the crowd about X",
+        # not "you liked X", so explain in the units the ranking used.
+        values = self.input_values(rated_items, z)
+        indptr, indices, data = self.S.indptr, self.S.indices, self.S.data
+
+        contribs: list[tuple[int, float]] = []
+        for i, vi in zip(rated_items, values):
+            lo, hi = indptr[i], indptr[i + 1]
+            hit = np.flatnonzero(indices[lo:hi] == candidate)
+            if len(hit):
+                contribs.append((int(i), float(data[lo + hit[0]] * vi)))
         contribs.sort(key=lambda t: -abs(t[1]))
         return contribs[:top]

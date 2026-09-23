@@ -328,3 +328,40 @@ def test_rank_shrinkage_leaves_the_star_prediction_alone(engine):
     b = cf.score(rated, z)
     np.testing.assert_allclose(a.pred_z, b.pred_z, atol=1e-9)
     assert not np.allclose(a.rank_score, b.rank_score)
+
+
+def test_explanation_agrees_with_the_score_it_explains(engine):
+    """S is truncated per row and therefore asymmetric. explain() must read the
+    same direction score() does, or a recommendation can report contributors
+    that did not drive it -- or, as happened live, none at all while the score
+    was built from two.
+    """
+    cf, _ = engine
+    cf.config = replace(cf.config, use_residual_input=False, min_support=0.0,
+                        popularity_alpha=0.0, pred_shrinkage_k=0.0, rank_shrinkage_k=0.0)
+    rated = np.array([0, 1, 2, 6, 7])
+    z = np.array([1.2, 1.1, 1.3, -1.0, -0.9])
+    s = cf.score(rated, z)
+
+    for pos, cand in enumerate(s.item_idx):
+        n_used = int(s.n_neighbours[pos])
+        n_explained = len(cf.explain(int(cand), rated, z, top=99))
+        assert n_explained == n_used, (
+            f"candidate {cand}: scored from {n_used} neighbours, "
+            f"explained with {n_explained}"
+        )
+
+
+def test_explanation_contributions_sum_toward_the_numerator(engine):
+    """Each contribution is sim * value -- the exact term score() accumulated."""
+    cf, _ = engine
+    cf.config = replace(cf.config, use_residual_input=False, min_support=0.0,
+                        popularity_alpha=0.0, pred_shrinkage_k=0.0, rank_shrinkage_k=0.0)
+    rated = np.array([0, 1, 6])
+    z = np.array([1.0, 0.5, -1.0])
+    s = cf.score(rated, z)
+    j = int(s.item_idx[0])
+
+    total = sum(c for _, c in cf.explain(j, rated, z, top=99))
+    expected = sum(cf.S[int(i), j] * zi for i, zi in zip(rated, z))
+    assert total == pytest.approx(expected, rel=1e-5, abs=1e-9)
