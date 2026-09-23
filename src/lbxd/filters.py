@@ -282,6 +282,15 @@ def diversify(
     keep_rows = []
     for pos, row in enumerate(df.itertuples(index=False)):
         title = getattr(row, "clean_title", "") or ""
+
+        # A result with one neighbour behind it has no explanation to give.
+        nb = getattr(row, "n_neighbours", None)
+        if (
+            config.min_neighbours_to_show
+            and nb is not None
+            and nb < config.min_neighbours_to_show
+        ):
+            continue
         year = getattr(row, "year", None)
 
         if config.dedupe_same_work:

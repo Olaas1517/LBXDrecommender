@@ -382,6 +382,19 @@ class FilterConfig:
     # for a film indexed under both its theatrical and extended cuts.
     dedupe_same_work: bool = True
 
+    # Never show a recommendation that cannot be explained.
+    #
+    # The engine's whole claim over matrix factorisation is that every result
+    # decomposes into "because you rated X, Y and Z the way you did". A result
+    # assembled from a single neighbour has no such story -- it prints with no
+    # `because` line at all -- and in gem mode, where the support floor is
+    # deliberately low, those were reaching the top of the list.
+    #
+    # This is a presentation rule, not a scoring one: the film stays ranked and
+    # still counts in evaluation, it just is not offered as advice. Two is the
+    # minimum that can honestly be called a pattern.
+    min_neighbours_to_show: int = 2
+
     # Also suppress works the member has already seen ANY part of.
     #
     # WHY: excluding "films you have watched" is done by film identity, so

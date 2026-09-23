@@ -158,3 +158,30 @@ class TestSeenWorkSuppression:
         )
         out = diversify(df, 10, FILTER, exclude_works=base_titles("Stalker"))
         assert len(out) == 1
+
+
+class TestExplainability:
+    def _frame(self, rows):
+        return pd.DataFrame(rows, columns=["clean_title", "year", "rank_score", "n_neighbours"])
+
+    def test_a_result_with_one_neighbour_is_not_offered(self):
+        """The engine's claim over matrix factorisation is that every result
+        decomposes into "because you rated X, Y and Z". One neighbour is not a
+        pattern, and it prints with no `because` line at all."""
+        df = self._frame([
+            ("Thin Evidence", 1933, 9.0, 1),
+            ("Real Recommendation", 1962, 8.0, 24),
+        ])
+        out = diversify(df, 10, FILTER)
+        assert list(out["clean_title"]) == ["Real Recommendation"]
+
+    def test_the_guard_can_be_switched_off(self):
+        df = self._frame([("Thin Evidence", 1933, 9.0, 1)])
+        out = diversify(df, 10, FilterConfig(min_neighbours_to_show=0))
+        assert len(out) == 1
+
+    def test_frames_without_the_column_are_unaffected(self):
+        """diversify is also called on frames that carry no neighbour count."""
+        df = pd.DataFrame([("Stalker", 1979, 9.0)],
+                          columns=["clean_title", "year", "rank_score"])
+        assert len(diversify(df, 10, FILTER)) == 1
